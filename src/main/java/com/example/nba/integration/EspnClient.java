@@ -29,10 +29,13 @@ public final class EspnClient {
             try {
                 HttpRequest req = HttpRequest.newBuilder()
                         .uri(URI.create(url))
-                        .timeout(Duration.ofSeconds(15))
+                        .timeout(Duration.ofSeconds(20))
                         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-                        .header("Accept", "application/json")
+                        .header("Accept", "application/json,text/plain,*/*")
                         .header("Accept-Language", "en-US,en;q=0.9")
+                        // These two help with ESPN sometimes returning HTML/blocked responses:
+                        .header("Referer", "https://www.espn.com/")
+                        .header("Origin", "https://www.espn.com")
                         .GET()
                         .build();
 
@@ -40,16 +43,15 @@ public final class EspnClient {
                 String body = res.body();
 
                 if (res.statusCode() != 200) {
-                    last = new RuntimeException("ESPN status=" + res.statusCode() + " body=" + abbreviate(body));
+                    last = new RuntimeException("ESPN status=" + res.statusCode() + " url=" + url + " body=" + abbreviate(body));
                 } else if (looksLikeHtml(body)) {
-                    // This is the exact "<" parse error you were getting.
-                    last = new RuntimeException("ESPN returned HTML instead of JSON (blocked/redirected).");
+                    last = new RuntimeException("ESPN returned HTML instead of JSON (blocked/redirected). url=" + url);
                 } else {
                     return mapper.readTree(body);
                 }
 
             } catch (Exception e) {
-                last = new RuntimeException("ESPN call failed (attempt " + attempt + ")", e);
+                last = new RuntimeException("ESPN call failed (attempt " + attempt + ") url=" + url, e);
             }
 
             sleep(backoffMs);

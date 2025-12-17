@@ -24,6 +24,7 @@ public final class EspnRosterSeeder {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final EspnClient api;
+    private final StatBasedRatingModel ratingModel;
 
     // Teams endpoint
     private static final String TEAMS_URL =
@@ -31,6 +32,7 @@ public final class EspnRosterSeeder {
 
     public EspnRosterSeeder(EspnClient api) {
         this.api = api;
+        this.ratingModel = new StatBasedRatingModel(api);
     }
 
     public void seed(TeamManagementService service, Role actor) {
@@ -58,12 +60,8 @@ public final class EspnRosterSeeder {
         JsonNode teamsJson = api.get(TEAMS_URL);
 
         JsonNode teams = teamsJson.at("/sports/0/leagues/0/teams");
-        if (teams == null || !teams.isArray()) {
-            teams = teamsJson.at("/leagues/0/teams");
-        }
-        if (teams == null || !teams.isArray()) {
-            throw new RuntimeException("Unexpected ESPN teams JSON shape");
-        }
+        if (teams == null || !teams.isArray()) teams = teamsJson.at("/leagues/0/teams");
+        if (teams == null || !teams.isArray()) throw new RuntimeException("Unexpected ESPN teams JSON shape");
 
         PlayerFactory pf = new PlayerFactory();
         SalaryStrategy salary = new StandardSalaryStrategy();
@@ -82,10 +80,8 @@ public final class EspnRosterSeeder {
             String teamId = text(team, "id", abbr);
 
             service.registerTeam(actor, new Team(abbr, name, new SalaryCap(Money.of(140_000_000))));
-
             System.out.printf("Loading roster %2d/30: %s (%s)%n", idx, name, abbr);
 
-            // Direct JSON roster endpoint
             String rosterUrl =
                     "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/teams/" + teamId + "/roster";
 
@@ -93,7 +89,6 @@ public final class EspnRosterSeeder {
                 JsonNode rosterJson = api.get(rosterUrl);
                 ArrayNode cachedPlayers = MAPPER.createArrayNode();
 
-                // Key fix: per-team deterministic assignment for G/F → PG/SG and SF/PF
                 PositionAssigner assigner = new PositionAssigner();
 
                 int added = extractAndSeedRoster(rosterJson, service, actor, abbr, pf, salary, cachedPlayers, assigner);
@@ -108,7 +103,8 @@ public final class EspnRosterSeeder {
                 successRosters++;
                 System.out.println("  ✅ Added " + added + " players");
 
-                sleep(120);
+                // Small delay between teams to reduce ESPN blocking
+                sleep(200);
 
             } catch (Exception e) {
                 System.out.println("  ⚠ Failed roster for " + abbr + ": " + rootCause(e));
@@ -140,9 +136,7 @@ public final class EspnRosterSeeder {
                                      PositionAssigner assigner) {
 
         JsonNode athletes = rosterJson.get("athletes");
-        if (athletes == null || athletes.isNull()) {
-            athletes = rosterJson.at("/team/athletes");
-        }
+        if (athletes == null || athletes.isNull()) athletes = rosterJson.at("/team/athletes");
 
         int added = 0;
 
@@ -151,14 +145,13 @@ public final class EspnRosterSeeder {
 
                 // ESPN often groups: { "position": {...}, "items": [ ... ] }
                 if (groupOrAthlete.has("items") && groupOrAthlete.get("items").isArray()) {
-                    String groupPosRaw = readPositionRaw(groupOrAthlete); // <-- FIX: inherit group position
+                    String groupPosRaw = readPositionRaw(groupOrAthlete);
                     for (JsonNode item : groupOrAthlete.get("items")) {
                         if (seedOnePlayer(service, actor, teamAbbr, item, groupPosRaw, pf, salary, cachedPlayers, assigner)) {
                             added++;
                         }
                     }
                 } else {
-                    // Not grouped
                     if (seedOnePlayer(service, actor, teamAbbr, groupOrAthlete, "", pf, salary, cachedPlayers, assigner)) {
                         added++;
                     }
@@ -186,15 +179,26 @@ public final class EspnRosterSeeder {
         String name = text(athlete, "displayName", null);
         if (pid == null || name == null) return false;
 
-        // Read position from athlete; if missing, use group position.
         String posRaw = readPositionRaw(athlete);
         if (posRaw.isBlank()) posRaw = (groupPosRaw == null) ? "" : groupPosRaw;
-
-        // ✅ FIX: deterministic mapping for G/F to ensure SG and PF exist across teams.
         Position pos = assigner.assign(posRaw);
 
-        int off = deriveRating(name, 70, 95);
-        int def = deriveRating(name + "#D", 60, 90);
+        // --- NEW: per-player stat fetch with explicit OK/FAIL output ---
+        int off;
+        int def;
+
+        StatBasedRatingModel.Result rr = ratingModel.rate(pid);
+        if (rr.ok()) {
+            off = rr.rating().offense();
+            def = rr.rating().defense();
+            System.out.printf("    ✅ Stats OK: %s (%s) -> O:%d D:%d%n", name, pid, off, def);
+        } else {
+            // fallback so the system still runs even if ESPN blocks stats
+            off = 0;
+            def = 0;
+            System.out.printf("    ⚠ Stats FAIL: %s (%s) -> %s -> fallback O:%d D:%d%n",
+                    name, pid, rr.reason(), off, def);
+        }
 
         PlayerBuilder b = new PlayerBuilder()
                 .playerId(pid)
@@ -206,6 +210,8 @@ public final class EspnRosterSeeder {
 
         Player p = pf.create(ExperienceLevel.VETERAN, b);
 
+        // NOTE: ESPN does NOT provide actual salaries here.
+        // Keep your contract system, but treat this as placeholder money unless you integrate a real salary source.
         Contract c = Contract.builder()
                 .totalValue(Money.of(5_000_000))
                 .years(1)
@@ -214,9 +220,11 @@ public final class EspnRosterSeeder {
         try {
             service.signPlayer(actor, teamAbbr, p, c, salary);
         } catch (Exception ignored) {
-            // cap/validation
+            // cap/validation failures -> player not added
+            return false;
         }
 
+        // Cache now stores the computed rating too (so next run is instant)
         ObjectNode pj = MAPPER.createObjectNode();
         pj.put("playerId", pid);
         pj.put("name", name);
@@ -225,13 +233,12 @@ public final class EspnRosterSeeder {
         pj.put("def", def);
         cachedPlayers.add(pj);
 
+        // small delay between player stats requests to reduce ESPN rate limiting
+        sleep(40);
+
         return true;
     }
 
-    /**
-     * Pull the "best available" position string from ESPN JSON nodes.
-     * ESPN varies: sometimes abbreviation exists, sometimes name/displayName exists, sometimes the group has it.
-     */
     private static String readPositionRaw(JsonNode node) {
         if (node == null || node.isNull()) return "";
 
@@ -244,7 +251,6 @@ public final class EspnRosterSeeder {
         String disp = node.at("/position/displayName").asText("");
         if (!disp.isBlank()) return disp;
 
-        // Some ESPN objects use "position" as a plain string (rare)
         JsonNode pos = node.get("position");
         if (pos != null && pos.isTextual()) return pos.asText("");
 
@@ -299,14 +305,6 @@ public final class EspnRosterSeeder {
         return (v == null || v.isNull()) ? def : v.asText(def);
     }
 
-    /**
-     * Deterministic assignment to ensure SG and PF exist when ESPN only provides generic Guard/Forward.
-     *
-     * - If we see "PG"/"SG"/"SF"/"PF"/"C" explicitly -> use it.
-     * - If we see "G" or "GUARD" -> alternate PG, SG, PG, SG...
-     * - If we see "F" or "FORWARD" -> alternate SF, PF, SF, PF...
-     * - If unknown -> SF.
-     */
     private static final class PositionAssigner {
         private int guardCount = 0;
         private int forwardCount = 0;
@@ -314,29 +312,24 @@ public final class EspnRosterSeeder {
         Position assign(String raw) {
             raw = (raw == null) ? "" : raw.trim().toUpperCase();
 
-            // Composite like "SF/PF"
             if (raw.contains("PG")) return Position.PG;
             if (raw.contains("SG")) return Position.SG;
             if (raw.contains("PF")) return Position.PF;
             if (raw.contains("SF")) return Position.SF;
             if (raw.contains("C"))  return Position.C;
 
-            // Generic words
             if (raw.equals("G") || raw.contains("GUARD")) {
-                // Alternate to ensure both PG and SG appear
                 Position p = (guardCount % 2 == 0) ? Position.PG : Position.SG;
                 guardCount++;
                 return p;
             }
 
             if (raw.equals("F") || raw.contains("FORWARD")) {
-                // Alternate to ensure both SF and PF appear
                 Position p = (forwardCount % 2 == 0) ? Position.SF : Position.PF;
                 forwardCount++;
                 return p;
             }
 
-            // Sometimes "C-F" or similar weird strings
             if (raw.contains("CENTER")) return Position.C;
 
             return Position.SF;
